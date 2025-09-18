@@ -1,22 +1,14 @@
 #!/usr/bin/env python3
 """
-Group students by preferences and proficiency, and output plots + reports.
-
-Usage:
-  python group_students.py input.tsv --group-size 3 --style dissimilar [--out-stem my_run] [--seed 42]
-
-Input TSV columns:
-  - name (str)
-  - proficiency (one of: proficient, intermediate, basic, none)
-  - preferences (semicolon-delimited list of names; empty allowed)
+Group students by preferences first and then by proficiency, producing target-sized groups and reports.
+Includes an exact CP-SAT solver mode that maximizes the number of satisfied preferences under hard group-size constraints.
+Outputs plots, TSV/TXT listings, an unmet-preferences report, and a network map PNG.
 """
 
 from __future__ import annotations
 import argparse
 import collections
-import math
 import os
-import re
 import sys
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Set, Optional
@@ -26,26 +18,26 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 import networkx as nx
+from matplotlib.patches import Circle
+import warnings
 
-VALID_PROF = ["none", "basic", "intermediate", "proficient"]  # order for plots
+# Quiet seaborn/pandas deprecation chatter that doesn’t affect results
+warnings.filterwarnings("ignore", category=FutureWarning, module="seaborn")
 
-# -----------------------------
-# Data structures
-# -----------------------------
+VALID_PROF = ["none", "basic", "intermediate", "proficient"]  # fixed order for plots
+
 
 @dataclass
 class Student:
+    """Container for one student's name, proficiency, and preference list."""
     name: str
     proficiency: str
     pref_names: List[str] = field(default_factory=list)
 
-# -----------------------------
-# IO & parsing
-# -----------------------------
 
 def load_input(tsv_path: str) -> List[Student]:
+    """Read and normalize the input TSV (name, proficiency, preferences)."""
     df = pd.read_csv(tsv_path, sep="\t", dtype=str).fillna("")
-    # normalize columns
     cols = {c.lower().strip(): c for c in df.columns}
     for required in ["name", "proficiency", "preferences"]:
         if required not in cols:
@@ -53,7 +45,6 @@ def load_input(tsv_path: str) -> List[Student]:
     df = df.rename(columns={cols["name"]: "name",
                             cols["proficiency"]: "proficiency",
                             cols["preferences"]: "preferences"})
-    # normalize entries
     students: List[Student] = []
     for _, row in df.iterrows():
         name = str(row["name"]).strip()
@@ -66,33 +57,19 @@ def load_input(tsv_path: str) -> List[Student]:
         students.append(Student(name=name, proficiency=prof, pref_names=pref_names))
     return students
 
-# -----------------------------
-# Group sizing logic
-# -----------------------------
 
 def compute_target_group_sizes(n: int, group_size: int) -> List[int]:
-    """Create as many groups of size 'group_size' as possible and
-    distribute stragglers to make r groups with size 'group_size+1'.
-
-    If n < group_size, return [n].
-    """
+    """Compute target sizes: ⌊n/s⌋ groups with size s and the first (n mod s) groups with size s+1."""
     if n <= 0:
         return []
     if n <= group_size:
         return [n]
-    g = n // group_size  # number of groups
-    r = n % group_size   # number of groups that will have +1
-    sizes = []
-    # First r groups have size group_size+1, others have group_size
-    for i in range(g):
-        sizes.append(group_size + (1 if i < r else 0))
-    # Defensive assert:
-    assert sum(sizes) == n, f"Target sizes {sizes} do not sum to n={n}"
+    g = n // group_size
+    r = n % group_size
+    sizes = [(group_size + 1 if i < r else group_size) for i in range(g)]
+    assert sum(sizes) == n
     return sizes
 
-# -----------------------------
-# Grouping algorithm
-# -----------------------------
 
 def group_students(
     students: List[Student],
@@ -100,51 +77,38 @@ def group_students(
     style: str,
     rng: np.random.Generator
 ) -> Tuple[List[List[str]], Dict[str, int]]:
-    """
-    Preference-first, then proficiency-based filling.
-
-    style: 'similar' or 'dissimilar'
-    Returns:
-      groups: list of lists of student names
-      membership: mapping name -> group_index
-    """
+    """Assign students to groups using a preference-first pass then proficiency-based fill (similar/dissimilar)."""
     assert style in {"similar", "dissimilar"}
     n = len(students)
     if n == 0:
         return [], {}
 
     target_sizes = compute_target_group_sizes(n, group_size)
-    if not target_sizes:
-        return [], {}
     num_groups = len(target_sizes)
 
     name_to_student: Dict[str, Student] = {s.name: s for s in students}
-    # Build a lowercase map for resolving case-insensitive preference matching
     lower_to_name = {s.name.lower(): s.name for s in students}
 
-    # Clean preference names to match canonical casing; drop unknown prefs
+    # Normalize preference casing and drop unknowns
     for s in students:
         cleaned = []
         for pref in s.pref_names:
             key = pref.lower()
             if key in lower_to_name:
                 cleaned.append(lower_to_name[key])
-        s.pref_names = list(dict.fromkeys(cleaned))  # dedupe, preserve order
+        s.pref_names = list(dict.fromkeys(cleaned))
 
-    # Bookkeeping
     unassigned: Set[str] = set(s.name for s in students)
     groups: List[List[str]] = [[] for _ in range(num_groups)]
-    capacities = target_sizes.copy()  # remaining capacity per group
 
-    # Helper queues by proficiency
     by_prof: Dict[str, List[str]] = {p: [] for p in VALID_PROF}
     for s in students:
         by_prof[s.proficiency].append(s.name)
-    # We'll pop from these; shuffle to avoid bias
     for p in by_prof:
         rng.shuffle(by_prof[p])
 
     def pop_from_prof(p: str) -> Optional[str]:
+        """Pop one unassigned student from a proficiency bucket."""
         while by_prof[p]:
             cand = by_prof[p].pop()
             if cand in unassigned:
@@ -152,18 +116,19 @@ def group_students(
         return None
 
     def current_prof_counts(members: List[str]) -> Dict[str, int]:
+        """Count proficiencies in a group."""
         cnt = {p: 0 for p in VALID_PROF}
         for nm in members:
             cnt[name_to_student[nm].proficiency] += 1
         return cnt
 
     def place_in_existing_group_with_pref(target_name: str) -> bool:
-        """Try to place into a group that already contains any of their preferences."""
+        """Try to place a student into a group containing any of their preferences."""
         prefs = set(name_to_student[target_name].pref_names)
         if not prefs:
             return False
         for gi, members in enumerate(groups):
-            if capacities[gi] <= 0:
+            if len(members) >= target_sizes[gi]:
                 continue
             if prefs.intersection(members):
                 groups[gi].append(target_name)
@@ -172,144 +137,170 @@ def group_students(
         return False
 
     def open_new_group_and_seed(seed_name: str) -> bool:
-        """Open the next group with free capacity and seed with this student, then try to add their preferred partners."""
-        # pick first group with available capacity and empty or smallest current size
-        candidates = [gi for gi in range(num_groups) if capacities[gi] > 0]
+        """Start the smallest not-full group with this student, then add their preferred partners if available."""
+        candidates = [gi for gi in range(num_groups) if len(groups[gi]) < target_sizes[gi]]
         if not candidates:
             return False
-        # Prefer the smallest (to fill from empty up)
         candidates.sort(key=lambda gi: len(groups[gi]))
         gi = candidates[0]
         groups[gi].append(seed_name)
         unassigned.discard(seed_name)
-        # try to add the seed's preferred partners
         for pref in name_to_student[seed_name].pref_names:
-            if capacities[gi] - len(groups[gi]) <= 0:
+            if len(groups[gi]) >= target_sizes[gi]:
                 break
             if pref in unassigned:
                 groups[gi].append(pref)
                 unassigned.discard(pref)
         return True
 
-    # -------- Pass 1: preference-driven placement --------
-    # Order by number of preferences (desc), then random for tie-breaking
-    pref_students = [s.name for s in students if len(s.pref_names) > 0]
+    pref_students = [s.name for s in students if s.pref_names]
     rng.shuffle(pref_students)
     pref_students.sort(key=lambda nm: len(name_to_student[nm].pref_names), reverse=True)
-
     for nm in list(pref_students):
         if nm not in unassigned:
             continue
-        # Try to sit next to preferred partners if they already exist in a group
         if place_in_existing_group_with_pref(nm):
             continue
-        # Otherwise open a new group slot and seed it with this student and their preferred partners
         open_new_group_and_seed(nm)
 
-    # -------- Pass 2: fill remaining seats based on style --------
-    # Prepare list of groups sorted by remaining capacity so we always fill those first
     def fill_group_similar(gi: int):
-        # Aim to match dominant proficiency in the group
-        if capacities[gi] - len(groups[gi]) <= 0:
+        """Fill a group by matching its dominant proficiency (or the most abundant overall if empty)."""
+        if len(groups[gi]) >= target_sizes[gi]:
             return
         counts = current_prof_counts(groups[gi])
-        # If group empty, just take from the most abundant pool overall
         if sum(counts.values()) == 0:
-            # choose prof with most remaining candidates
             avail_counts = {p: sum(1 for nm in by_prof[p] if nm in unassigned) for p in VALID_PROF}
-            choices = sorted(VALID_PROF, key=lambda p: avail_counts[p], reverse=True)
-            chosen = None
-            for p in choices:
+            for p in sorted(VALID_PROF, key=lambda p: avail_counts[p], reverse=True):
                 cand = pop_from_prof(p)
                 if cand:
-                    groups[gi].append(cand)
-                    unassigned.discard(cand)
-                    return
+                    groups[gi].append(cand); unassigned.discard(cand); return
             return
-        # find dominant proficiency in current group
         dominant = sorted(VALID_PROF, key=lambda p: counts[p], reverse=True)[0]
-        # first try dominant
         cand = pop_from_prof(dominant)
         if cand is None:
-            # try any other with availability, preferring nearest neighbors (same-ish level)
             for p in VALID_PROF:
                 cand = pop_from_prof(p)
                 if cand is not None:
                     break
         if cand is not None:
-            groups[gi].append(cand)
-            unassigned.discard(cand)
+            groups[gi].append(cand); unassigned.discard(cand)
 
     def fill_group_dissimilar(gi: int):
-        # Aim to balance mix: pick the proficiency with lowest current count in this group (if available)
-        if capacities[gi] - len(groups[gi]) <= 0:
+        """Fill a group by choosing the least represented proficiency available to balance composition."""
+        if len(groups[gi]) >= target_sizes[gi]:
             return
         counts = current_prof_counts(groups[gi])
-        # order profs by ascending count, tie-break by availability (desc)
         avail_counts = {p: sum(1 for nm in by_prof[p] if nm in unassigned) for p in VALID_PROF}
-        order = sorted(VALID_PROF, key=lambda p: (counts[p], -avail_counts[p]))
-        chosen: Optional[str] = None
-        for p in order:
+        for p in sorted(VALID_PROF, key=lambda p: (counts[p], -avail_counts[p])):
             cand = pop_from_prof(p)
             if cand is not None:
-                chosen = cand
-                break
-        if chosen is not None:
-            groups[gi].append(chosen)
-            unassigned.discard(chosen)
+                groups[gi].append(cand); unassigned.discard(cand); return
 
-    # Keep filling until capacities are met
-    # We honor target sizes by ensuring we don't exceed each group's target size
-    target_len = target_sizes[:]  # absolute target count per group
     while unassigned:
         progressed = False
-        # iterate groups with remaining space
         for gi in range(num_groups):
-            if len(groups[gi]) >= target_len[gi]:
+            if len(groups[gi]) >= target_sizes[gi]:
                 continue
-            if style == "similar":
-                before = len(groups[gi])
-                fill_group_similar(gi)
-                after = len(groups[gi])
-            else:
-                before = len(groups[gi])
-                fill_group_dissimilar(gi)
-                after = len(groups[gi])
-            if after > before:
-                progressed = True
+            before = len(groups[gi])
+            (fill_group_similar if style == "similar" else fill_group_dissimilar)(gi)
+            progressed |= (len(groups[gi]) > before)
             if not unassigned:
                 break
-        # If we couldn't make progress (e.g., due to earlier seeding skew), force-place remaining into any group with space
         if not progressed:
             for gi in range(num_groups):
-                while len(groups[gi]) < target_len[gi] and unassigned:
-                    # pop from any prof bucket
+                while len(groups[gi]) < target_sizes[gi] and unassigned:
                     any_prof = next((p for p in VALID_PROF if any(nm in unassigned for nm in by_prof[p])), None)
-                    fallback = None
-                    if any_prof is not None:
-                        fallback = pop_from_prof(any_prof)
-                    else:
-                        # scan unassigned directly
-                        fallback = next(iter(unassigned))
-                    groups[gi].append(fallback)
-                    unassigned.discard(fallback)
+                    fallback = pop_from_prof(any_prof) if any_prof else next(iter(unassigned))
+                    groups[gi].append(fallback); unassigned.discard(fallback)
             break
 
-    # Build membership map
     membership: Dict[str, int] = {}
     for gi, g in enumerate(groups):
         for nm in g:
             membership[nm] = gi
     return groups, membership
 
-# -----------------------------
-# Reporting helpers
-# -----------------------------
 
-def save_proficiency_distribution(
+def solve_optimal_groups_exact(
     students: List[Student],
-    out_stem: str
-):
+    group_sizes: List[int],
+    mutual_weight: int = 2,
+    time_limit_sec: Optional[float] = 60.0,
+    workers: Optional[int] = None,
+) -> Tuple[List[List[str]], float, str]:
+    """Solve for global maximum satisfied preferences with CP-SAT (returns groups, objective value, solver status)."""
+    try:
+        from ortools.sat.python import cp_model
+    except Exception as e:
+        raise RuntimeError(
+            "Exact optimization requires OR-Tools. Install with: pip install ortools"
+        ) from e
+
+    names = [s.name for s in students]
+    n = len(names)
+    G = len(group_sizes)
+    idx = {name: i for i, name in enumerate(names)}
+
+    # Build directed preference list and weights; upweight mutual preferences if desired.
+    prefs: List[Tuple[int, int]] = []
+    pref_set = {(i, j) for i in range(n) for j in range(n)}
+    raw_pref = {i: set() for i in range(n)}
+    for s in students:
+        i = idx[s.name]
+        for p in s.pref_names:
+            if p in idx:
+                raw_pref[i].add(idx[p])
+    weights: Dict[Tuple[int, int], int] = {}
+    for i in range(n):
+        for j in raw_pref[i]:
+            w = 1
+            if mutual_weight and i in raw_pref.get(j, set()):
+                w = mutual_weight
+            prefs.append((i, j))
+            weights[(i, j)] = w
+
+    m = cp_model.CpModel()
+    x = {(i, g): m.NewBoolVar(f"x_{i}_{g}") for i in range(n) for g in range(G)}
+    y = {(i, j, g): m.NewBoolVar(f"y_{i}_{j}_{g}") for (i, j) in prefs for g in range(G)}
+
+    # Each student exactly one group
+    for i in range(n):
+        m.Add(sum(x[i, g] for g in range(G)) == 1)
+
+    # Exact group sizes
+    for g in range(G):
+        m.Add(sum(x[i, g] for i in range(n)) == group_sizes[g])
+
+    # Same-group linearization for each preferred pair
+    for (i, j) in prefs:
+        for g in range(G):
+            m.Add(y[i, j, g] <= x[i, g])
+            m.Add(y[i, j, g] <= x[j, g])
+            m.Add(y[i, j, g] >= x[i, g] + x[j, g] - 1)
+
+    # Objective: maximize total satisfied preferences (weighted)
+    m.Maximize(sum(weights[(i, j)] * y[i, j, g] for (i, j) in prefs for g in range(G)))
+
+    solver = cp_model.CpSolver()
+    if time_limit_sec is not None:
+        solver.parameters.max_time_in_seconds = float(time_limit_sec)
+    if workers is not None:
+        solver.parameters.num_search_workers = int(workers)
+
+    status = solver.Solve(m)
+    groups = [[] for _ in range(G)]
+    if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        for i in range(n):
+            for g in range(G):
+                if solver.Value(x[i, g]):
+                    groups[g].append(names[i])
+        return groups, solver.ObjectiveValue(), solver.StatusName(status)
+    else:
+        return [[] for _ in range(G)], 0.0, solver.StatusName(status)
+
+
+def save_proficiency_distribution(students: List[Student], out_stem: str):
+    """Save overall proficiency counts as TSV and bar plot."""
     df = pd.DataFrame({"proficiency": [s.proficiency for s in students]})
     counts = df["proficiency"].value_counts().reindex(VALID_PROF, fill_value=0)
     counts_df = counts.rename_axis("proficiency").reset_index(name="count")
@@ -318,26 +309,21 @@ def save_proficiency_distribution(
     plt.figure()
     sns.barplot(data=counts_df, x="proficiency", y="count", order=VALID_PROF)
     plt.title("Overall Proficiency Distribution")
-    plt.xlabel("Proficiency")
-    plt.ylabel("Count")
+    plt.xlabel("Proficiency"); plt.ylabel("Count")
     plt.tight_layout()
     plt.savefig(f"{out_stem}__proficiency_distribution.png", dpi=600)
     plt.close()
 
+
 def group_combo_label(group_members: List[str], name_to_student: Dict[str, Student]) -> str:
+    """Return a label like '2 basic + 1 none' describing a group's composition."""
     counts = collections.Counter(name_to_student[nm].proficiency for nm in group_members)
-    # order by VALID_PROF and format like "2 basic + 1 none"
-    parts = []
-    for p in VALID_PROF:
-        if counts[p] > 0:
-            parts.append(f"{counts[p]} {p}")
+    parts = [f"{counts[p]} {p}" for p in VALID_PROF if counts[p] > 0]
     return " + ".join(parts) if parts else "empty"
 
-def save_group_combo_plot(
-    groups: List[List[str]],
-    students: List[Student],
-    out_stem: str
-):
+
+def save_group_combo_plot(groups: List[List[str]], students: List[Student], out_stem: str):
+    """Save group composition frequencies as TSV and bar plot."""
     name_to_student = {s.name: s for s in students}
     labels = [group_combo_label(g, name_to_student) for g in groups]
     freq = collections.Counter(labels)
@@ -347,28 +333,23 @@ def save_group_combo_plot(
     plt.figure()
     sns.barplot(data=combos_df, x="combo", y="count")
     plt.title("Group Proficiency Combinations")
-    plt.xlabel("Combination")
-    plt.ylabel("Frequency")
+    plt.xlabel("Combination"); plt.ylabel("Frequency")
     plt.xticks(rotation=45, ha="right")
     plt.tight_layout()
     plt.savefig(f"{out_stem}__group_proficiency_combos.png", dpi=600)
     plt.close()
 
-def save_unmet_preferences(
-    groups: List[List[str]],
-    students: List[Student],
-    out_stem: str
-):
-    name_to_group: Dict[str, int] = {}
-    for gi, g in enumerate(groups):
-        for nm in g:
-            name_to_group[nm] = gi
 
+def save_unmet_preferences(groups: List[List[str]], students: List[Student], out_stem: str):
+    """Save a TSV listing students whose preferences weren’t fully met."""
+    name_to_group: Dict[str, int] = {nm: gi for gi, g in enumerate(groups) for nm in g}
     rows = []
     for s in students:
         if not s.pref_names:
             continue
-        gi = name_to_group[s.name]
+        gi = name_to_group.get(s.name, None)
+        if gi is None:
+            continue
         group_set = set(groups[gi])
         unmet = [p for p in s.pref_names if p not in group_set]
         if unmet:
@@ -378,72 +359,147 @@ def save_unmet_preferences(
                 "input_preferences": "; ".join(s.pref_names),
                 "unmet_preferences": "; ".join(unmet)
             })
-    out_df = pd.DataFrame(rows, columns=["student","assigned_group_members","input_preferences","unmet_preferences"])
-    out_df.to_csv(f"{out_stem}__unmet_preferences.tsv", sep="\t", index=False)
+    pd.DataFrame(rows, columns=["student","assigned_group_members","input_preferences","unmet_preferences"]) \
+      .to_csv(f"{out_stem}__unmet_preferences.tsv", sep="\t", index=False)
 
-def save_network_map(
-    groups: List[List[str]],
-    students: List[Student],
-    out_stem: str,
-    seed: Optional[int] = None
-):
+
+def save_network_map(groups: List[List[str]], students: List[Student], out_stem: str, seed: Optional[int] = None):
+    """Draw a clustered, non-overlapping preference network (nodes colored by group) and save as PNG."""
     G = nx.DiGraph()
-    # Add nodes with group attribute
     name_to_group: Dict[str, int] = {}
     for gi, g in enumerate(groups):
         for nm in g:
             name_to_group[nm] = gi
             G.add_node(nm, group=gi)
 
-    # Add directed edges for preferences
-    name_set = set(name_to_group.keys())
+    roster = set(name_to_group)
     for s in students:
         for pref in s.pref_names:
-            if s.name in name_set and pref in name_set:
+            if s.name in roster and pref in roster:
                 G.add_edge(s.name, pref)
 
-    # Layout; seed for reproducibility
-    rng = np.random.default_rng(seed)
-    pos = nx.spring_layout(G, seed=rng.integers(0, 1_000_000))
+    if G.number_of_nodes() == 0:
+        plt.figure(figsize=(10, 8))
+        plt.title("Student Preference Network (no nodes)")
+        plt.axis("off")
+        plt.tight_layout()
+        plt.savefig(f"{out_stem}__network_map.png", dpi=600)
+        plt.close()
+        return
 
-    # Color nodes by group
-    groups_order = list(range(len(groups)))
-    # Assign a color per group using matplotlib default cycle
-    # We'll map group index -> integer to pass to draw
+    rng = np.random.default_rng(int(seed) if seed is not None else None)
+    seed_int = int(seed) if seed is not None else None
+
+    num_groups = len(groups)
+    angle_step = 2 * np.pi / max(num_groups, 1)
+    cluster_radius = 8.0
+    group_centers = {
+        gi: np.array([cluster_radius * np.cos(gi * angle_step),
+                      cluster_radius * np.sin(gi * angle_step)])
+        for gi in range(num_groups)
+    }
+
+    positions: Dict[str, np.ndarray] = {}
+    local_radius = 1.8
+    base_k = 0.8
+    for gi, members in enumerate(groups):
+        if not members:
+            continue
+        H = G.subgraph(members).copy()
+        k = base_k / max(np.sqrt(len(members)), 1.0)
+        local_pos = nx.spring_layout(H, seed=seed_int, k=k, iterations=300)
+        pts = np.array(list(local_pos.values()))
+        if len(pts) > 0:
+            pts = pts - pts.mean(axis=0)
+            denom = np.max(np.linalg.norm(pts, axis=1)) or 1.0
+            pts = (pts / denom) * local_radius
+        for (node, _), p in zip(local_pos.items(), pts):
+            positions[node] = group_centers[gi] + p
+
+    min_sep = 0.35
+    nodes = list(positions.keys())
+    for _ in range(60):
+        moved = False
+        for i in range(len(nodes)):
+            ni = nodes[i]; pi = positions[ni]
+            for j in range(i + 1, len(nodes)):
+                nj = nodes[j]; pj = positions[nj]
+                delta = pi - pj
+                dist = np.linalg.norm(delta)
+                if dist < 1e-9:
+                    jitter = rng.normal(scale=1e-3, size=2)
+                    positions[ni] = pi + jitter
+                    positions[nj] = pj - jitter
+                    moved = True
+                elif dist < min_sep:
+                    push = (min_sep - dist) / 2.0
+                    unit = delta / dist
+                    positions[ni] = pi + unit * push
+                    positions[nj] = pj - unit * push
+                    moved = True
+        if not moved:
+            break
+
+    plt.figure(figsize=(11, 9))
+    pos = {n: (positions[n][0], positions[n][1]) for n in G.nodes()}
     node_colors = [name_to_group[nm] for nm in G.nodes()]
-    # Draw
-    plt.figure(figsize=(10, 8))
-    nx.draw_networkx_nodes(G, pos, node_size=400, node_color=node_colors, cmap=plt.cm.tab20)
+
+    for gi, center in group_centers.items():
+        if not groups[gi]:
+            continue
+        circle = Circle(center, local_radius * 1.15, facecolor="none", edgecolor="lightgray", linewidth=1.0, zorder=0)
+        plt.gca().add_patch(circle)
+
+    nx.draw_networkx_edges(G, pos, arrows=True, arrowsize=10, width=0.9, alpha=0.5, edge_color="gray")
+    nx.draw_networkx_nodes(G, pos, node_size=420, node_color=node_colors, cmap=plt.cm.tab20,
+                           linewidths=1.0, edgecolors="black")
     nx.draw_networkx_labels(G, pos, font_size=8)
-    nx.draw_networkx_edges(G, pos, arrows=True, arrowsize=10, width=0.8, alpha=0.6)
+
     plt.axis("off")
-    plt.title("Student Preference Network (colored by assigned group)")
+    plt.title("Student Preference Network (group-clustered, non-overlapping)")
     plt.tight_layout()
     plt.savefig(f"{out_stem}__network_map.png", dpi=600)
     plt.close()
 
+
 def save_groups_tsv(groups: List[List[str]], students: List[Student], out_stem: str):
-    """Not requested, but often useful for review."""
+    """Save a TSV mapping group index to student name and proficiency."""
     name_to_prof = {s.name: s.proficiency for s in students}
-    rows = []
-    for gi, g in enumerate(groups):
-        for nm in g:
-            rows.append({"group_index": gi, "name": nm, "proficiency": name_to_prof[nm]})
+    rows = [{"group_index": gi, "name": nm, "proficiency": name_to_prof[nm]}
+            for gi, g in enumerate(groups) for nm in g]
     pd.DataFrame(rows).to_csv(f"{out_stem}__assigned_groups.tsv", sep="\t", index=False)
 
-# -----------------------------
-# Main
-# -----------------------------
+
+def save_groups_txt(groups: List[List[str]], out_stem: str):
+    """Save a human-readable TXT listing of each group and its members (names only)."""
+    lines = []
+    for gi, g in enumerate(groups):
+        lines.append(f"Group {gi} ({len(g)}): " + ", ".join(g))
+    with open(f"{out_stem}__groups.txt", "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
 
 def main():
-    parser = argparse.ArgumentParser(description="Group students by preferences and proficiency.")
+    """Parse CLI args, run grouping (heuristic or exact), and write all outputs."""
+    parser = argparse.ArgumentParser(description="Group students; heuristic or exact solver; emit plots and reports.")
     parser.add_argument("input_tsv", help="Path to input TSV with name, proficiency, preferences")
     parser.add_argument("--group-size", type=int, required=True, help="Ideal group size (>=2 recommended)")
     parser.add_argument("--style", choices=["similar", "dissimilar"], required=True,
-                        help="How to fill groups by proficiency after respecting preferences.")
+                        help="How to fill groups by proficiency after respecting preferences (heuristic mode).")
     parser.add_argument("--out-stem", type=str, default=None,
                         help="Optional output filename stem. Defaults to input stem.")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility.")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed (0…4294967295).")
+
+    # Exact solver options
+    parser.add_argument("--optimize", choices=["heuristic", "exact"], default="heuristic",
+                        help="Use heuristic (default) or exact CP-SAT to maximize satisfied preferences.")
+    parser.add_argument("--mutual-weight", type=int, default=2,
+                        help="Weight for mutual preferences in exact mode (one-way is weight 1).")
+    parser.add_argument("--time-limit", type=float, default=60.0,
+                        help="Time limit in seconds for exact mode (set 0 or negative for no limit).")
+    parser.add_argument("--workers", type=int, default=None,
+                        help="CP-SAT parallel workers in exact mode (default uses OR-Tools default).")
+
     args = parser.parse_args()
 
     if args.group_size <= 0:
@@ -453,25 +509,43 @@ def main():
     in_stem = os.path.splitext(os.path.basename(args.input_tsv))[0]
     out_stem = args.out_stem or in_stem
 
-    rng = np.random.default_rng(args.seed)
-
-    # Load
     students = load_input(args.input_tsv)
 
-    # Group
-    groups, membership = group_students(students, args.group_size, args.style, rng=rng)
+    if args.optimize == "exact":
+        sizes = compute_target_group_sizes(len(students), args.group_size)
+        tl = None if args.time_limit and args.time_limit <= 0 else float(args.time_limit)
+        try:
+            groups, obj, status = solve_optimal_groups_exact(
+                students,
+                sizes,
+                mutual_weight=args.mutual_weight,
+                time_limit_sec=tl,
+                workers=args.workers,
+            )
+            if not any(groups):
+                print(f"Exact solver returned status {status} and no assignment; falling back to heuristic.", file=sys.stderr)
+                rng = np.random.default_rng(int(args.seed))
+                groups, _ = group_students(students, args.group_size, args.style, rng=rng)
+        except RuntimeError as e:
+            print(str(e), file=sys.stderr)
+            print("Falling back to heuristic mode.", file=sys.stderr)
+            rng = np.random.default_rng(int(args.seed))
+            groups, _ = group_students(students, args.group_size, args.style, rng=rng)
+    else:
+        rng = np.random.default_rng(int(args.seed))
+        groups, _ = group_students(students, args.group_size, args.style, rng=rng)
 
-    # Outputs
     save_proficiency_distribution(students, out_stem)
     save_group_combo_plot(groups, students, out_stem)
     save_unmet_preferences(groups, students, out_stem)
-    save_network_map(groups, students, out_stem, seed=args.seed)
-    save_groups_tsv(groups, students, out_stem)  # helper
+    save_network_map(groups, students, out_stem, seed=int(args.seed))
+    save_groups_tsv(groups, students, out_stem)
+    save_groups_txt(groups, out_stem)
 
-    # Nice summary to stdout
     print(f"Created {len(groups)} groups. Output stem: {out_stem}")
     for i, g in enumerate(groups):
         print(f"Group {i} ({len(g)}): {', '.join(g)}")
+
 
 if __name__ == "__main__":
     main()

@@ -1,0 +1,16 @@
+name	proficiency	preferences
+Alex Doe	intermediate	Chris Kim; Jordan Wu
+Chris Kim	proficient	Alex Doe; Priya Shah
+Jordan Wu	basic	Alex Doe
+Priya Shah	proficient	Chris Kim
+Sam Patel	none	
+Taylor Ng	basic	Jordan Wu
+Morgan Lee	intermediate	Alex Doe; Taylor Ng
+Riley Chen	proficient	
+Jamie Park	none	Taylor Ng; Sam Patel
+Casey Brown	basic	Jamie Park
+Avery Smith	intermediate	Morgan Lee
+Quinn Davis	proficient	Riley Chen
+Drew Garcia	basic	Casey Brown
+Kendall Ortiz	none	Jamie Park; Sam Patel
+Parker Evans	intermediate	Avery Smith
