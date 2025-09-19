@@ -21,3 +21,11 @@ It also produces:
 python -m venv .venv
 source .venv/bin/activate  # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
+```
+
+## Recommended arguments for MOL290 TA's
+```
+python3 group_students.py your_class_data.tsv --group-size 3 --style similar --out-stem test_similar-optimal --optimize exact --mutual-weight 2 --time-limit 120
+```
+Though the time limit is probably unnecessary.
+`your_class_data.tsv` should be organized in the same format as [test.tsv](/demo/test.tsv)
